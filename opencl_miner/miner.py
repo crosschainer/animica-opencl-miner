@@ -235,9 +235,19 @@ async def run_miner(args: Any) -> None:
     await miner.start()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+
+    def _set_stop(*_: Any) -> None:
+        stop.set()
+
     for signame in ("SIGINT", "SIGTERM"):
         if hasattr(signal, signame):
-            loop.add_signal_handler(getattr(signal, signame), stop.set)
+            sig = getattr(signal, signame)
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                # Windows Proactor loops do not implement add_signal_handler; fall back to sync handler.
+                with contextlib.suppress(ValueError, RuntimeError):
+                    signal.signal(sig, _set_stop)
     log.info("Miner started. Press Ctrl+C to stop.")
     await stop.wait()
     await miner.stop()
