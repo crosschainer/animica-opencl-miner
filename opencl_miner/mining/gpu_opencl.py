@@ -227,6 +227,7 @@ __kernel void find_hashshares(
     __global const uchar* header,
     uint header_len,
     __global const uchar* mix,
+    uint mix_len,
     ulong start_nonce,
     double cutoff,
     __global ulong* out_nonces,
@@ -239,12 +240,12 @@ __kernel void find_hashshares(
   ulong nonce = start_nonce + (ulong)gid;
   
   // Check size fits
-  if (header_len + 32 + 8 > 136) return;
+  if (header_len + mix_len + 8 > 136) return;
   
   // Build message in private memory
   __private uchar msg[136];
   for (uint i = 0; i < header_len; i++) msg[i] = header[i];
-  for (uint i = 0; i < 32; i++) msg[header_len + i] = mix[i];
+  for (uint i = 0; i < mix_len; i++) msg[header_len + i] = mix[i];
   
   // Append nonce (little-endian)
   __private uchar n8[8];
@@ -254,7 +255,7 @@ __kernel void find_hashshares(
   
   // Compute digest
   __private uchar dig[32];
-  sha3_256_singleblock(msg, header_len + 32 + 8, dig);
+  sha3_256_singleblock(msg, header_len + mix_len + 8, dig);
   
   // Map digest to uniform (0,1]
   ulong hi = ((ulong)dig[0]<<56)|((ulong)dig[1]<<48)|((ulong)dig[2]<<40)|((ulong)dig[3]<<32)|
@@ -286,6 +287,7 @@ __kernel void find_hashshares(
 class _Prepared:
     header: bytes
     mix_seed: bytes
+    mix_len: int
     use_gpu: bool  # false when payload would exceed single-block rate
 
 
@@ -338,9 +340,13 @@ class OpenCLBackend:
 
     def prepare_header(self, header_bytes: bytes, mix_seed: bytes) -> _Prepared:
         # We only support single-block hashing in-kernel (rate 136)
-        use_gpu = (len(header_bytes) + 32 + 8) <= 136
+        use_gpu = (len(header_bytes) + len(mix_seed) + 8) <= 136
+        mix = bytes(mix_seed)
         return _Prepared(
-            header=bytes(header_bytes), mix_seed=bytes(mix_seed), use_gpu=use_gpu
+            header=bytes(header_bytes),
+            mix_seed=mix,
+            mix_len=len(mix),
+            use_gpu=use_gpu,
         )
 
     def scan(
@@ -377,7 +383,8 @@ class OpenCLBackend:
             header_b = prepared.header
             mix_b = prepared.mix_seed
             hb = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=header_b)
-            mb = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=mix_b)
+            mix_host = mix_b if mix_b else b"\x00"
+            mb = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=mix_host)
 
             out_nonces = cl.Buffer(ctx, mf.WRITE_ONLY, size=max_found * 8)
             out_u = cl.Buffer(ctx, mf.WRITE_ONLY, size=max_found * 4)
@@ -400,6 +407,7 @@ class OpenCLBackend:
                     hb,
                     _u32(len(header_b)),
                     mb,
+                    _u32(prepared.mix_len),
                     _u64(nonce),
                     _f64(cutoff),
                     out_nonces,

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from .job import JobConfig
@@ -40,6 +41,7 @@ class StratumOpenCLMiner:
         max_found: int = 4,
         device_kwargs: Optional[Dict[str, Any]] = None,
         agent: str = "animica-opencl/0.1",
+        legacy_mix_seed: bool = False,
     ) -> None:
         self._host = host
         self._port = port
@@ -50,14 +52,18 @@ class StratumOpenCLMiner:
         self._iterations = iterations
         self._max_found = max_found
         self._device_kwargs = device_kwargs or {}
+        self._legacy_mixseed_forced = legacy_mix_seed
+        self._legacy_mixseed_active = legacy_mix_seed
 
         self._current_share_target = 0.01
         self._current_theta = 800_000
+        self._raw_job: Optional[JobConfig] = None
         self._active_job: Optional[JobConfig] = None
         self._scanner: Optional[OpenCLScanner] = None
         self._share_queue: "asyncio.Queue[ShareCandidate]" = asyncio.Queue()
         self._submit_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        self._low_diff_rejections = 0
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -76,6 +82,9 @@ class StratumOpenCLMiner:
                 log.info("GPU initialized: %s", device_info)
         except Exception:
             pass
+
+        if self._legacy_mixseed_forced:
+            log.info("Legacy mixSeed compatibility mode is enabled (hashing header||nonce).")
 
         await self._connect_with_retries()
 
@@ -96,11 +105,48 @@ class StratumOpenCLMiner:
     async def wait_forever(self) -> None:
         await self._stop.wait()
 
+    def _make_effective_job(self, raw_job: JobConfig) -> JobConfig:
+        if not self._legacy_mixseed_active:
+            return raw_job
+        return replace(raw_job, mix_seed=b"")
+
+    def _refresh_active_job(self) -> None:
+        if not self._raw_job:
+            return
+        job_cfg = self._make_effective_job(self._raw_job)
+        self._active_job = job_cfg
+        if self._scanner:
+            self._scanner.set_job(job_cfg)
+
+    def _enable_legacy_mix_mode(self) -> None:
+        if self._legacy_mixseed_active:
+            return
+        self._legacy_mixseed_active = True
+        log.warning(
+            "Detected legacy Stratum server that ignores mixSeed; hashing header||nonce for compatibility."
+        )
+        self._refresh_active_job()
+
     # ------------------- Stratum callbacks -------------------
 
     async def _handle_set_difficulty(self, share_target: float, theta_micro: int) -> None:
-        self._current_share_target = share_target
-        self._current_theta = theta_micro
+        if share_target > 0:
+            self._current_share_target = share_target
+        else:
+            log.warning(
+                "Received invalid shareTarget=%.6f; keeping previous %.6f",
+                share_target,
+                self._current_share_target,
+            )
+
+        if theta_micro > 0:
+            self._current_theta = theta_micro
+        else:
+            log.warning(
+                "Received invalid thetaMicro=%s; keeping previous %s",
+                theta_micro,
+                self._current_theta,
+            )
         log.info(
             "Difficulty update shareTarget=%.6f theta=%d",
             share_target,
@@ -121,11 +167,21 @@ class StratumOpenCLMiner:
         if mix_hex is None:
             mix_hex = header.get("mixSeed")
 
-        theta = int(job.get("thetaMicro") or header.get("thetaMicro") or self._current_theta)
-        share_target = float(job.get("shareTarget") or self._current_share_target)
+        theta_raw = job.get("thetaMicro") or header.get("thetaMicro")
+        theta = int(theta_raw) if theta_raw is not None else self._current_theta
+        if theta <= 0:
+            theta = self._current_theta
+
+        share_raw = job.get("shareTarget")
+        try:
+            share_target = float(share_raw) if share_raw is not None else self._current_share_target
+        except (TypeError, ValueError):
+            share_target = self._current_share_target
+        if share_target <= 0:
+            share_target = self._current_share_target
         height = int(job.get("height") or header.get("number") or 0)
 
-        job_cfg = JobConfig(
+        raw_job = JobConfig(
             job_id=str(job.get("jobId") or header.get("hash") or "unknown"),
             header_bytes=_decode_hex(sign_hex),
             mix_seed=_decode_hex(mix_hex, fallback_bytes=32),
@@ -136,6 +192,8 @@ class StratumOpenCLMiner:
             target_hex=job.get("target"),
         )
 
+        self._raw_job = raw_job
+        job_cfg = self._make_effective_job(raw_job)
         self._active_job = job_cfg
         if self._scanner:
             self._scanner.set_job(job_cfg)
@@ -171,6 +229,7 @@ class StratumOpenCLMiner:
             accepted = result.get("accepted", False)
             is_block = result.get("isBlock", False)
             reason = result.get("reason")
+            self._record_share_outcome(candidate, bool(accepted), reason)
             log.info(
                 "Share submitted nonce=%s accepted=%s block=%s reason=%s",
                 nonce_hex,
@@ -180,6 +239,26 @@ class StratumOpenCLMiner:
             )
         except Exception as exc:
             log.error("Failed to submit share nonce=%s: %s", nonce_hex, exc)
+
+    def _record_share_outcome(
+        self, candidate: ShareCandidate, accepted: bool, reason: Optional[str]
+    ) -> None:
+        if accepted:
+            self._low_diff_rejections = 0
+            return
+        if self._legacy_mixseed_active or self._legacy_mixseed_forced:
+            return
+        if not reason or "low difficulty" not in reason.lower():
+            self._low_diff_rejections = 0
+            return
+        job = candidate.job
+        target = getattr(job, "share_target", 0.0)
+        if target <= 0 or candidate.d_ratio < max(target * 0.98, target - 1e-6):
+            self._low_diff_rejections = 0
+            return
+        self._low_diff_rejections += 1
+        if self._low_diff_rejections >= 8:
+            self._enable_legacy_mix_mode()
 
     async def _connect_with_retries(self) -> None:
         delay = 1.0
@@ -230,6 +309,7 @@ async def run_miner(args: Any) -> None:
         iterations=args.iterations,
         max_found=args.max_found,
         device_kwargs=device_kwargs,
+        legacy_mix_seed=getattr(args, "legacy_mix_seed", False),
     )
 
     await miner.start()

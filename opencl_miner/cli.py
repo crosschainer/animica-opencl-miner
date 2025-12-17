@@ -86,6 +86,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log verbosity",
     )
+    parser.add_argument(
+        "--legacy-mix-seed",
+        action="store_true",
+        help="Ignore mixSeed when hashing (compatibility mode for legacy pools).",
+    )
     return parser.parse_args(argv)
 
 
