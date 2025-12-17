@@ -77,6 +77,8 @@ opencl-miner \
 | `--platform` | *(auto)* | OpenCL platform index override |
 | `--device` | *(auto)* | OpenCL device index override |
 | `--log-level` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `--submit-work` | `true` | Only submit solutions that already meet the full block target (skip share uploads). Use `--submit-shares` to also report near-miss shares. |
+| `--legacy-mix-seed` | `false` | Force hashing `signBytes||nonce` for pools that do not use `mixSeed`. |
 
 ## Performance
 

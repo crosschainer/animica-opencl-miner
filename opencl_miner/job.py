@@ -37,3 +37,13 @@ class JobConfig:
         ratio = self.share_target if self.share_target > 0 else 1.0
         # Clamp to a positive integer to avoid passing zero to the GPU backend.
         return max(1, int(base * ratio))
+
+    @property
+    def block_target_int(self) -> Optional[int]:
+        if not self.target_hex:
+            return None
+        target = self.target_hex[2:] if self.target_hex.startswith("0x") else self.target_hex
+        try:
+            return int(target, 16)
+        except ValueError:
+            return None

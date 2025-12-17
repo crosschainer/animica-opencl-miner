@@ -42,6 +42,7 @@ class StratumOpenCLMiner:
         device_kwargs: Optional[Dict[str, Any]] = None,
         agent: str = "animica-opencl/0.1",
         legacy_mix_seed: bool = False,
+        submit_work: bool = False,
     ) -> None:
         self._host = host
         self._port = port
@@ -64,6 +65,7 @@ class StratumOpenCLMiner:
         self._submit_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._low_diff_rejections = 0
+        self._blocks_only = submit_work
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -85,6 +87,8 @@ class StratumOpenCLMiner:
 
         if self._legacy_mixseed_forced:
             log.info("Legacy mixSeed compatibility mode is enabled (hashing header||nonce).")
+        if self._blocks_only:
+            log.info("Submit-work mode enabled: only submitting solutions that meet the full block target.")
 
         await self._connect_with_retries()
 
@@ -216,6 +220,13 @@ class StratumOpenCLMiner:
         if not self._client:
             log.warning("Share ready but no Stratum client is active; dropping share.")
             return
+        is_block_candidate = self._is_block_candidate(candidate)
+        if self._blocks_only and not is_block_candidate:
+            log.debug(
+                "Discarding share nonce=%s (blocks-only mode, digest above target).",
+                hex(candidate.nonce),
+            )
+            return
         nonce_hex = hex(candidate.nonce)
         body = {
             "dRatio": candidate.d_ratio,
@@ -229,6 +240,9 @@ class StratumOpenCLMiner:
             accepted = result.get("accepted", False)
             is_block = result.get("isBlock", False)
             reason = result.get("reason")
+            if self._blocks_only and not is_block and is_block_candidate:
+                # Some servers do not report is_block; assume success means block.
+                is_block = bool(accepted)
             self._record_share_outcome(candidate, bool(accepted), reason)
             log.info(
                 "Share submitted nonce=%s accepted=%s block=%s reason=%s",
@@ -239,6 +253,13 @@ class StratumOpenCLMiner:
             )
         except Exception as exc:
             log.error("Failed to submit share nonce=%s: %s", nonce_hex, exc)
+
+    def _is_block_candidate(self, candidate: ShareCandidate) -> bool:
+        target = candidate.job.block_target_int
+        if not target or not candidate.digest:
+            return False
+        digest_int = int.from_bytes(candidate.digest, "big", signed=False)
+        return digest_int <= target
 
     def _record_share_outcome(
         self, candidate: ShareCandidate, accepted: bool, reason: Optional[str]
@@ -301,6 +322,10 @@ async def run_miner(args: Any) -> None:
     if getattr(args, "device", None) is not None:
         device_kwargs["device_index"] = args.device
 
+    submit_work = getattr(args, "submit_work", None)
+    if submit_work is None:
+        submit_work = True
+
     miner = StratumOpenCLMiner(
         host=args.host,
         port=args.port,
@@ -310,6 +335,7 @@ async def run_miner(args: Any) -> None:
         max_found=args.max_found,
         device_kwargs=device_kwargs,
         legacy_mix_seed=getattr(args, "legacy_mix_seed", False),
+        submit_work=submit_work,
     )
 
     await miner.start()

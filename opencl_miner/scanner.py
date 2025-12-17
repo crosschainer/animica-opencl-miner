@@ -25,6 +25,7 @@ class ShareCandidate:
     nonce: int
     u: float
     d_ratio: float
+    digest: bytes
 
     @property
     def h_micro(self) -> int:
@@ -88,6 +89,7 @@ class OpenCLScanner(threading.Thread):
                 nonce=int(share["nonce"]),
                 u=float(share["u"]),
                 d_ratio=float(share["d_ratio"]),
+                digest=bytes(share.get("hash") or b""),
             )
             self._loop.call_soon_threadsafe(self._results.put_nowait, candidate)
 

@@ -87,6 +87,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Log verbosity",
     )
     parser.add_argument(
+        "--submit-work",
+        dest="submit_work",
+        action="store_true",
+        default=None,
+        help="Only submit candidates when they satisfy the full block target.",
+    )
+    parser.add_argument(
+        "--submit-shares",
+        dest="submit_work",
+        action="store_false",
+        help="Also submit near-miss shares that satisfy the share target.",
+    )
+    parser.add_argument(
         "--legacy-mix-seed",
         action="store_true",
         help="Ignore mixSeed when hashing (compatibility mode for legacy pools).",
